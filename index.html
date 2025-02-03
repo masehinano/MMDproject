@@ -1,48 +1,67 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="ja">
 <head>
   <meta charset="UTF-8" />
-  <title>MMD Model Viewer (Idle Motion + Blink + Smile)</title>
+  <title>Local Ammo (Factory) + Importmap Example</title>
   <style>
     body { margin: 0; overflow: hidden; }
     canvas { display: block; }
   </style>
-  <!-- importmap の中で three.js と MMDLoader を読み込み -->
+
+  <!-- 1) Factory形式の ammo.wasm.js を読み込み -->
+  <!--    WebAssembly本体 ammo.wasm.wasm は内部で自動ロードされる -->
+  <!--    ここではグローバルに window.Ammo(=関数) を定義するだけ -->
+  <script src="./libs/ammo.wasm.js"></script>
+
+  <!-- 2) three.jsやMMDLoaderなどはCDN経由の importmap で読み込み -->
   <script type="importmap">
-    {
-      "imports": {
-        "three": "https://cdn.jsdelivr.net/npm/three@0.154.0/build/three.module.js",
-        "OrbitControls": "https://cdn.jsdelivr.net/npm/three@0.154.0/examples/jsm/controls/OrbitControls.js",
-        "MMDLoader": "https://cdn.jsdelivr.net/npm/three@0.154.0/examples/jsm/loaders/MMDLoader.js"
-      }
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.154.0/build/three.module.js",
+      "OrbitControls": "https://cdn.jsdelivr.net/npm/three@0.154.0/examples/jsm/controls/OrbitControls.js",
+      "MMDLoader": "https://cdn.jsdelivr.net/npm/three@0.154.0/examples/jsm/loaders/MMDLoader.js",
+      "MMDAnimationHelper": "https://cdn.jsdelivr.net/npm/three@0.154.0/examples/jsm/animation/MMDAnimationHelper.js"
     }
+  }
   </script>
 </head>
 <body>
+  <!-- 3) メイン処理をモジュールスクリプトで書く -->
   <script type="module">
     import * as THREE from "three";
     import { OrbitControls } from "OrbitControls";
     import { MMDLoader } from "MMDLoader";
+    import { MMDAnimationHelper } from "MMDAnimationHelper";
 
-    // シーンとレンダラー、カメラのセットアップ
+    // --------------------------------------------
+    // Ammo（Factory）を初期化してグローバルに設定
+    // --------------------------------------------
+    // ammo.wasm.js で定義された Ammo という関数を実行 (Promiseを返す)
+    const AmmoLib = await Ammo();
+    // 返ってきた AmmoLib 内に btDefaultCollisionConfiguration 等が含まれる
+    // これを window.Ammo に代入 → MMDPhysics が参照できるようにする
+    window.Ammo = AmmoLib;
+    console.log("Ammo initialized. Check:", window.Ammo.btDefaultCollisionConfiguration);
+
+    // --------------------------------------------
+    // ここから three.js + MMDAnimationHelper の処理
+    // --------------------------------------------
+
+    // シーン基本セットアップ
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(0xffffff);
 
-    const camera = new THREE.PerspectiveCamera(
-      45,
-      window.innerWidth / window.innerHeight,
-      1,
-      2000
+    const camera = new THREE.PerspectiveCamera(45,
+      window.innerWidth / window.innerHeight, 1, 2000
     );
-    camera.position.set(0, 9.5, 15); 
+    camera.position.set(0, 9.5, 15);
 
     const renderer = new THREE.WebGLRenderer({ antialias: true });
     renderer.setSize(window.innerWidth, window.innerHeight);
     document.body.appendChild(renderer.domElement);
 
-    // OrbitControls をセットアップ
     const controls = new OrbitControls(camera, renderer.domElement);
-    controls.target.set(0, 10, 0); // カメラの注視点をモデル付近にする
+    controls.target.set(0, 10, 0);
     controls.update();
 
     // ライト
@@ -53,80 +72,70 @@
     spotLight.position.set(15, 40, 35);
     scene.add(spotLight);
 
-    // MMDモデル関連
+    // MMD アニメ関連
     let model;
-    let isSmiling = false; // 笑顔中かどうかのフラグ
-    let smileMorphIndex;   // 笑顔モーフ("笑い")のインデックス
-    let blinkMorphIndex;   // まばたきモーフ("まばたき")のインデックス
+    let isSmiling = false;
+    let smileMorphIndex;
+    let blinkMorphIndex;
 
-    // 笑顔の5秒制限のための変数
-    let smileStartTime = 0;    // 笑顔を開始した時刻
-    const SMILE_DURATION = 5;  // 5秒で自動解除
-
-    // 呼吸用にモデルのベースY位置を記録しておく
+    let smileStartTime = 0;
+    const SMILE_DURATION = 5;
     const baseY = -5.5;
 
-    // まばたきアニメ用の変数
     let doBlink = false;
-    let blinkProgress = 0;   // 0～1まで変化して0に戻る、で一回の瞬き
-    let nextBlinkTime = 1.0; // 次のまばたきまでの時間(秒)
-    let blinkTimer = 0;      // 経過時間(秒)
+    let blinkProgress = 0;
+    let nextBlinkTime = 1.0;
+    let blinkTimer = 0;
 
-    // 経過時間計測用
     const clock = new THREE.Clock();
 
-    // モデルの腕を下げる(直立に近い姿勢にする)ための関数
+    // ★ 物理演算を可能にする MMDAnimationHelper (ここで Ammo を使う)
+    const helper = new MMDAnimationHelper({
+      physics: {
+        unitStep: 1 / 90,   // 物理演算をどの間隔で進めるか(秒)
+        maxStepNum: 3       // フレームあたり最大ステップ数
+      }
+    });
+
+    // モデルの姿勢修正用
     function fixArmPose(mesh) {
-      // SkinnedMesh の骨を取得
       const bones = mesh.skeleton.bones;
-
-      // 「右腕」「左腕」骨を取得（ログなどで骨名を確認済みとする）
-      const rightArmBone = bones.find(b => b.name === "右腕");
-      const leftArmBone  = bones.find(b => b.name === "左腕");
-
-      console.log("rightArmBone:", rightArmBone);
-      console.log("leftArmBone:", leftArmBone);
-
-      // 下げるためにZ軸で回転 (モデルによって軸や角度は要調整)
-      if (leftArmBone) {
-        leftArmBone.rotation.z = -0.4;
-      }
-      if (rightArmBone) {
-        rightArmBone.rotation.z = 0.4;
-      }
+      const rightArm = bones.find(b => b.name === "右腕");
+      const leftArm  = bones.find(b => b.name === "左腕");
+      if (rightArm) rightArm.rotation.z = 0.4;
+      if (leftArm)  leftArm.rotation.z = -0.4;
     }
 
-    // MMDのモデル読み込み
+    // MMDモデル読み込み
     const loader = new MMDLoader();
     loader.load(
-      './Lumine/Lumine.pmx', // モデルのパスを合わせてください
+      './model/Lumine/Lumine1.pmx',  // あなたのモデルパスに合わせてください
       (mesh) => {
         model = mesh;
         scene.add(mesh);
         model.position.set(0, baseY, 0);
 
-        // モーフ名を確認してインデックスを取得 (要: モデルにより異なる)
+        // モーフ名を確認してインデックスを取得
         // console.log(model.morphTargetDictionary);
-        smileMorphIndex = model.morphTargetDictionary["笑い"];      
+        smileMorphIndex = model.morphTargetDictionary["笑い"];
         blinkMorphIndex = model.morphTargetDictionary["まばたき"];
 
-        // 腕を下げる処理（モデルの姿勢修正）
         fixArmPose(model);
+
+        // 物理演算をONにして helper に追加
+        helper.add(model, { physics: true });
 
         // クリックで笑顔をトグル
         document.addEventListener('click', () => {
           if (model && smileMorphIndex !== undefined) {
-            // トグル
             isSmiling = !isSmiling;
-            console.log("表情切替: isSmiling = ", isSmiling);
-            // 笑顔になった瞬間の時刻を記録
             if (isSmiling) {
               smileStartTime = clock.elapsedTime;
             }
           }
         });
 
-        // アニメーションループ開始
+        // アニメーション開始
         animate();
       },
       undefined,
@@ -139,52 +148,42 @@
       const delta = clock.getDelta();
       const elapsed = clock.elapsedTime;
 
-      // --- 5秒で笑顔を自動解除 ---
+      // 笑顔5秒制限
       if (isSmiling && (elapsed - smileStartTime) > SMILE_DURATION) {
         isSmiling = false;
-        console.log("5秒経過したので笑顔解除");
       }
 
-      // --- 笑顔モーフをスムーズに適用 ---
+      // 笑顔モーフ
       if (model && smileMorphIndex !== undefined) {
-        const currentValue = model.morphTargetInfluences[smileMorphIndex] || 0;
-        const targetValue = isSmiling ? 1.0 : 0.0;
-        const smileSpeed = 0.05;
-        model.morphTargetInfluences[smileMorphIndex] 
-          = THREE.MathUtils.lerp(currentValue, targetValue, smileSpeed);
+        const currentVal = model.morphTargetInfluences[smileMorphIndex] || 0;
+        const targetVal = isSmiling ? 1.0 : 0.0;
+        model.morphTargetInfluences[smileMorphIndex]
+          = THREE.MathUtils.lerp(currentVal, targetVal, 0.05);
       }
 
-      // --- まばたきモーフ: 笑顔では瞬きしない ---
+      // まばたき
       if (model && blinkMorphIndex !== undefined) {
         if (isSmiling) {
-          // 笑顔中は瞬きモーフを0にして停止
           model.morphTargetInfluences[blinkMorphIndex] = 0;
           doBlink = false;
           blinkProgress = 0;
           blinkTimer = 0;
         } else {
-          // 通常時のまばたき処理
           blinkTimer += delta;
           if (!doBlink && blinkTimer >= nextBlinkTime) {
-            // まばたき開始
             doBlink = true;
             blinkProgress = 0;
             blinkTimer = 0;
-            // 次のまばたきまでの時間(1~4秒ぐらいランダム)
             nextBlinkTime = 1 + Math.random() * 5;
           }
           if (doBlink) {
-            // blinkProgressを0→1→0 と時間経過で変化させる(約0.2秒前後で往復)
-            blinkProgress += delta * 5; 
+            blinkProgress += delta * 5;
             if (blinkProgress <= 0.5) {
-              // 目を閉じる (0→1)
               model.morphTargetInfluences[blinkMorphIndex] = blinkProgress * 2.0;
             } else {
-              // 目を開く (1→0)
               model.morphTargetInfluences[blinkMorphIndex] = 2.0 - blinkProgress * 2.0;
             }
             if (blinkProgress >= 1.0) {
-              // まばたき終了
               doBlink = false;
               model.morphTargetInfluences[blinkMorphIndex] = 0.0;
             }
@@ -192,21 +191,20 @@
         }
       }
 
-      // --- 呼吸アニメ: モデルをわずかに上下させる ---
+      // 呼吸アニメ
       if (model) {
-        const t = clock.elapsedTime;
-        // sin波で上下に動かす(振幅0.05程度)
-        model.position.y = baseY + Math.sin(t * 1.5) * 0.08;
+        model.position.y = baseY + Math.sin(elapsed * 1.5) * 0.08;
       }
 
-      // カメラのOrbitControlsを更新
-      controls.update();
+      // 物理演算を更新
+      helper.update(delta);
 
-      // レンダリング
+      // カメラ制御＆描画
+      controls.update();
       renderer.render(scene, camera);
     }
 
-    // 画面リサイズ対応
+    // リサイズ対応
     window.addEventListener('resize', () => {
       camera.aspect = window.innerWidth / window.innerHeight;
       camera.updateProjectionMatrix();
